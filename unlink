@@ -1,0 +1,1097 @@
+#!/usr/bin/env python3
+
+from tablib import Dataset
+import re
+import struct
+import numpy as np
+from collections import defaultdict
+from itertools import chain
+from heapq import merge
+
+# for main:
+from sys import argv
+from os import path, makedirs
+
+# for nonfunctional writeout
+from mpwobj import MPWObject
+from blist import sortedlist
+
+
+def trim_rom(rom):
+    thelen, = struct.unpack_from('>L', rom, 0x1a)
+    return rom[:thelen]
+
+
+def read_mac_source_file(path):
+    # May insert arbitrary blank lines!
+    with open(path, encoding='mac_roman') as f:
+        return f.read().replace('\r','\n')
+
+
+def parse_asm(src):
+    """
+    Parse assembly into an iterable of {label: x, directive: y, args: [...], comment: z} dicts
+    """
+
+    # The MPW Asm (and PPCAsm) syntax is roughly:
+    # [label[:]][ directive[ arg[,arg...]]][;comment]
+
+    myre = (
+        r'^'
+        r'(?:(?P<label>\w+):?)?'
+        r'(?:\s+'
+            r'(?P<directive>[\w\.]+)'
+            r'(?P<args>\s+[^\n;,]+(?:\s*,\s*[^\n;,]+)*?)?'
+        r')?'
+        r'(?:\s*;\s*(?P<comment>.*))?'
+        r'\s*$'
+    )
+
+    myre = myre.replace(r'\s', r'[ \t]')
+
+    myre = re.compile(myre, re.MULTILINE)
+
+    for m in myre.finditer(src):
+        g = m.groupdict()
+
+        # Split args into a list
+        args = g['args']
+        if args is None:
+            args = []
+        else:
+            args = [memb.rstrip().lstrip() for memb in args.split(',')]
+        if args == ['']: args = []
+        g['args'] = args
+
+        # replace Nones with empty strings
+        g = {k: '' if v is None else v for (k, v) in g.items()}
+
+        yield g
+
+
+def vector_routines_from_source(src):
+    d = Dataset(headers=['name', 'vtable', 'voffset', 'register', 'comment'])
+
+    for line in parse_asm(src):
+        if line['directive'] == 'vIndirect':
+            if line['label'] == '' or len(line['args']) != 3:
+                raise ValueError('Malformed Vector Table line: %r %r' % (line['label'], line['args']))
+
+            vtable = int(line['args'][0][1:], 16)
+            voffset = int(line['args'][1][1:], 16)
+            register = int(line['args'][2][1:])
+
+            # Just dispose of register conventions???
+
+            d.append((line['label'], vtable, voffset, register, line['comment']))
+
+    return d
+
+
+def vector_table_from_rom(rom):
+    RTS = 0x4e75
+    BSR = 0x61ff
+
+    d = Dataset(headers=['vtable', 'voffset', 'offset'])
+
+    InitRomVectors, = struct.unpack_from('>L', rom, 0x66)
+
+    if InitRomVectors > len(rom) - 4: return d
+    if struct.unpack_from('>H', rom, InitRomVectors)[0] != BSR: return d # missing BSR InitDescriptors
+
+    # Following code is kinda borrowed...
+
+    InitDescriptors = InitRomVectors + struct.unpack_from('>l', rom, InitRomVectors + 2)[0] + 2
+
+    kDescTableFormat, = struct.unpack_from('>L', rom, InitDescriptors + 10)
+    tableCnt, = struct.unpack_from('>L', rom, InitDescriptors + 14)
+
+
+    top_bsr_base = InitRomVectors + 6
+
+    while struct.unpack_from('>H', rom, top_bsr_base)[0] != RTS:
+        if struct.unpack_from('>H', rom, top_bsr_base)[0] != BSR:
+            raise ValueError('Did not find expected BSR at 0x%x', top_bsr_base)
+
+        bsr_target = top_bsr_base + struct.unpack_from('>l', rom, top_bsr_base + 2)[0] + 2
+
+        # print('    InitVec @ 0x%x' % bsr_target)
+
+        if struct.unpack_from('>L', rom, bsr_target)[0] != 0x41fa000e: raise ValueError('Did not find expected LEA')
+
+        table, = struct.unpack_from('>H', rom, bsr_target + 6)
+        rec = struct.unpack_from('>L', rom, bsr_target + 16)[0] & 0xfffff
+        kInfoTableFormat, = struct.unpack_from('>L', rom, rec)
+        kDirectVector, = struct.unpack_from('>L', rom, rec+4)
+        entry_count, = struct.unpack_from('>L', rom, rec+8)
+
+        #print('Table %04x @ %x (VecInfo @ %x, %d vectors) %s' % (table, bsr_target, rec, entry_count, TableNames.get(table, '')))
+
+        for i in range(entry_count):
+            offset = 4 + 4 * i
+            implementation = struct.unpack_from('>L', rom, bsr_target + 16 + offset)[0] & 0xfffff
+
+            d.append((table, offset, implementation))
+
+        top_bsr_base += 6
+
+    return d
+
+
+def vector_glue_from_rom(rom):
+    d = Dataset(headers=['vtable', 'voffset', 'register', 'offset'])
+
+    endsearch, = struct.unpack_from('>L', rom, 0x1a)
+    rom = rom[:endsearch]
+
+    for i in range(0, len(rom) - 10, 2):
+        if struct.unpack_from('>L', rom, i)[0] != 0x2f3081e2: continue
+        if struct.unpack_from('>H', rom, i+8)[0] != 0x4e75: continue
+
+        table = struct.unpack_from('>H', rom, i+4)[0]
+        vector = struct.unpack_from('>H', rom, i+6)[0]
+
+        if not 0x2010 <= table <= 0x208c or table % 4 != 0:
+            continue
+
+        d.append((table, vector, 7, i))
+
+    for i in range(0, len(rom) - 10, 2):
+        if struct.unpack_from('>H', rom, i)[0] & 0xf1ff != 0x2078: continue
+        if struct.unpack_from('>H', rom, i+4)[0] & 0xf1f8 != 0x2068: continue
+        if struct.unpack_from('>H', rom, i+8)[0] & 0xfff8 != 0x4ed0: continue
+
+        ra = (struct.unpack_from('>H', rom, i)[0] >> 9) & 7
+        rb = (struct.unpack_from('>H', rom, i+4)[0] >> 9) & 7
+        rc = struct.unpack_from('>H', rom, i+4)[0] & 7
+        rd = struct.unpack_from('>H', rom, i+8)[0] & 7
+
+        if not (ra==rb==rc==rd): continue
+
+        table = struct.unpack_from('>H', rom, i+2)[0]
+        vector = struct.unpack_from('>H', rom, i+6)[0]
+
+        if not 0x2010 <= table <= 0x208c or table % 4 != 0:
+            continue
+
+        d.append((table, vector, ra, i))
+
+    return d
+
+
+def trap_routines_from_source(src):
+    trap_range = range(0xa000, 0xb000)
+
+    d = ['_%04X' % i for i in trap_range]
+
+    for line in parse_asm(src):
+        if any(x.startswith('&') for x in line['args']):
+            # Skip macro definitions
+            continue
+
+        if not 2 <= len(line['args']) < 4:
+            # print('cancelling', line)
+            continue
+
+        if line['directive'] == 'ToolBox':
+            trapnum = int(line['args'][0][1:], 16) + 0xa800
+        elif line['directive'] == 'OS':
+            trapnum = int(line['args'][0][1:], 16) + 0xa000
+        else:
+            continue
+
+        trapname = line['args'][1].upper()
+        if not trapname: continue
+
+        d[trapnum - 0xa000] = trapname
+
+    ds = Dataset()
+    ds.append_col(trap_range, header='trap')
+    ds.append_col(d, header='name')
+    return ds
+
+
+def trap_offsets_from_rom(rom):
+    d = Dataset(headers=['trap', 'offset'])
+
+    traptab, = struct.unpack_from('>L', rom, 0x22)
+
+    badtrap, = struct.unpack_from('>L', rom, 0x56)
+
+    traps = []
+
+    for i in range(0, (1024 + 256) * 4, 4):
+        offset, = struct.unpack_from('>L', rom, traptab + i)
+
+        if offset == badtrap or offset == 0: continue
+
+        if i >= 4096: #os
+            trapinsn = 0xa000 + (i-4096)//4
+        else: #toolbox
+            trapinsn = 0xa800 + i//4
+
+        d.append((trapinsn, offset))
+
+    return d
+
+
+def certain_module_boundaries_from_glue_offsets(offsets):
+    ROMALIGN = 16
+
+    yield 0 # start of the first module
+    p = None
+
+    # every time we encounter a glue n that is more than 10 bytes from the previous m,
+    # we yield m + 10 forward-aligned to a multiple of 16
+    for o in offsets:
+        if p is not None and o > p + 10:
+            cut = p + 10
+            cut += ROMALIGN - 1
+            cut -= cut % ROMALIGN
+            yield cut
+
+        p = o
+
+
+def aggregate_reasons(*iterables):
+    # each iterable should yield (offset, reason) tuples!
+    d = defaultdict(lambda: [])
+
+    for iterable in iterables:
+        for (offset, reason) in iterable:
+            d[offset].append(reason)
+
+    # I return an iterable of (offset, [reasons...])
+    return d.items()
+
+
+def module_ranges(starts, stops):
+    stops_and_reasons = sorted(stops)
+    starts_and_reasons = sorted(starts)
+
+    j = 0
+
+    for i, (start, start_reasons) in enumerate(starts_and_reasons):
+        while j < len(stops_and_reasons) and stops_and_reasons[j][0] <= start:
+            # always leave one stop at the end!
+            j += 1
+
+        possible_stops_and_reasons = []
+
+        if j < len(stops_and_reasons):
+            possible_stops_and_reasons.append(stops_and_reasons[j])
+
+        if i + 1 < len(starts_and_reasons):
+            possible_stops_and_reasons.append((starts_and_reasons[i+1][0], ['ran into next module']))
+
+        try:
+            stop, stop_reasons = min(possible_stops_and_reasons)
+        except ValueError:
+            continue # no way to know where to stop this putative module?
+
+        yield range(start, stop), start_reasons, stop_reasons
+
+
+def trimmed_module_ranges(mrngs, rom, glues):
+    # Can trim a module that is clearly just padded to align...
+    # *if* it is not followed by a glue!
+
+    glues = set(glues)
+
+    for (mrng, start_reasons, stop_reasons) in mrngs:
+        if mrng.stop not in glues:
+            if mrng.stop - mrng.start >= 16:
+                if any(rom[mrng.stop-16:mrng.stop-2]) and not any(rom[mrng.stop-2:mrng.stop]):
+                    newstop = mrng.stop
+                    while not any(rom[newstop-2:newstop]): newstop -= 2
+                    stop_reasons.append('%d nulls trimmed' % (mrng.stop-newstop))
+                    mrng = range(mrng.start, newstop)
+
+        yield mrng, start_reasons, stop_reasons
+
+
+
+
+def parse_manual(manual):
+    d = defaultdict(lambda: [])
+
+    prev = 0
+
+    for line in manual:
+        if not line['directive']:
+            continue
+
+        try:
+            offset = int(line['label'], 16)
+        except ValueError:
+            raise ValueError('manual file bad label: %r' % line)
+
+        if offset < prev:
+            raise ValueError('manual file out of order: %r' % line)
+
+        directive = line['directive'].upper()
+
+        d[directive].append((offset, *line['args']))
+
+        prev = offset
+
+    return d
+
+
+def manual_directives(manual, *directives):
+    lists = ([(offset, x, *args) for (offset, *args) in manual.get(x, [])] for x in directives)
+    # for l in lists:
+    #     for x in l:
+    #         print(x)
+    return merge(*lists)
+
+
+def file_ranges_from_manual(manual):
+    relevant_directives = list(manual_directives(manual, 'FILE', 'ENDF'))
+
+    for i, (offset, directive, *args) in enumerate(relevant_directives):
+        if directive != 'FILE':
+            continue
+
+        if i == len(relevant_directives) - 1:
+            raise ValueError('Unending FILE %x %r' % (offset, args))
+
+        yield (range(offset, relevant_directives[i+1][0]), *args)
+
+
+def feature_ranges_from_manual(manual, feature):
+    relevant_directives = iter(manual_directives(manual, 'FILE', 'ENDF', feature))
+
+    # potential problem here: manual sort order is not stable!
+
+    while True:
+        for offset, directive, *args in relevant_directives:
+            if (directive == 'FILE' and feature in args) or (directive == feature and 'OFF' not in args):
+                started_at = offset
+                break
+        else:
+            # No more starts!
+            break
+
+        for offset, directive, *args in relevant_directives:
+            if (directive == 'FILE' and feature not in args) or (directive == 'ENDF') or (directive == feature and 'OFF' in args):
+                ended_at = offset
+                break
+        else:
+            # No more ends!
+            raise ValueError('MODGUESS still turned on at end of manual file!')
+
+        yield range(started_at, ended_at)
+
+
+def ranges_that_must_be_in_a_single_module(gluelocs, implocs):
+    # both args are lists of: (offset, vtable, voffset)
+
+    gluelocs = sorted(gluelocs)
+
+    implocs = {(vt, vo): offset for (offset, vt, vo) in implocs}
+
+    # for each group of glues...
+    agi = 0
+    while agi < len(gluelocs):
+        bgi = agi + 1
+        while bgi < len(gluelocs) and gluelocs[bgi][0] == gluelocs[bgi-1][0] + 10:
+            bgi += 1
+
+        # agi:bgi now make a group of glues
+
+        range_stop = gluelocs[bgi-1][0] + 10
+
+        # Thing that I figured out:
+        # If the first element in a sequence of glues is *not* the first implementation,
+        # then that implementation label is an "entry point", *not* the module name
+
+        imp_of_first_glue = implocs[gluelocs[agi][1:]]
+
+        range_start = gluelocs[agi][0]
+        for offset, vtable, voffset in gluelocs[agi:bgi]:
+            this_imp = implocs[vtable, voffset]
+            if this_imp < range_start:
+                range_start = this_imp
+
+        if imp_of_first_glue > range_start:
+            range_start -= 2 # prohibit a cut on our left margin, because it is not a module!
+
+        yield range(range_start, range_stop)
+
+        agi = bgi
+
+
+
+def modguess(rom, ranges, noranges=[], labels={}):
+    ENDERS = [
+        # (length of instruction, opcode of instruction)
+        (2, b'\x4e\x75', 'RTS'),
+        (4, b'\x4e\x74', 'RTD'),
+        (6, b'\x60\xff', 'BRA.L'),
+    ]
+
+    for i in range(8):
+        ENDERS.append((2, bytes([0x4e, 0xd0+i]), 'JMP (A%d)' % i))
+
+    # Need to figure out which areas are contraindicated by glue!
+
+    noranges = iter(noranges)
+    try:
+        cur_norng = next(noranges)
+    except:
+        norng_exhausted = True
+    else:
+        norng_exhausted = False
+
+    for rng in ranges:
+        rng = range(max(rng.start, 16), rng.stop, 16)
+
+        for s in rng:
+            if not norng_exhausted:
+                try:
+                    while cur_norng.stop <= s:
+                        cur_norng = next(noranges)
+                except StopIteration:
+                    norng_exhausted = True
+                else:
+                    if cur_norng.start < s < cur_norng.stop:
+                        # print('cannot split at %x because of span %x-%x' % (s, cur_norng.start, cur_norng.stop))
+                        continue # cannot guess a module here!
+
+            # too much padding -- looks suspicious
+            if not any(rom[s - 16:s]): continue
+
+            reasons = ['align']
+
+            # either has a label, or is preceded by a return instruction!
+            labelled = s in labels
+
+            preceded_by_return = False
+            for oplen, opcode, opname in ENDERS:
+                # return instruction must leave at least 2 but no more then 14 zeroes of padding
+                for chk in range(max(0, s - 14 - oplen), s - oplen, 2):
+                    if rom[chk:chk+2] == opcode and not any(rom[chk+oplen:s]):
+                        preceded_by_return = True
+                        break
+                if preceded_by_return: break
+
+            if labelled: reasons.append('label')
+            if preceded_by_return: reasons.append('%s then padding' % opname)
+
+            # is not in a forbidden range!
+
+            if labelled or preceded_by_return:
+                yield s, 'MODGUESS (%s)' % ', '.join(reasons)
+
+
+def findrefs(bin):
+    THANGS = [
+        (b'\x60\x00', 2, 'BRA t'),
+        (b'\x61\x00', 2, 'BSR t'),
+        (b'\x60\xff', 4, 'BRA.L t'),
+        (b'\x61\xff', 4, 'BSR.L t'),
+        (b'\x4e\xba', 2, 'JSR t'),
+        (b'\x4e\xfa', 2, 'JMP t'),
+        (b'\x48\x7a', 2, 'PEA t'),
+        (b'\x41\xfa', 2, 'LEA t, A0'),
+        (b'\x43\xfa', 2, 'LEA t, A1'),
+        (b'\x45\xfa', 2, 'LEA t, A2'),
+        (b'\x47\xfa', 2, 'LEA t, A3'),
+        (b'\x49\xfa', 2, 'LEA t, A4'),
+        (b'\x4b\xfa', 2, 'LEA t, A5'),
+        (b'\x4d\xfa', 2, 'LEA t, A6'),
+        (b'\x4f\xfa', 2, 'LEA t, A7'),
+    ]
+
+    for i in range(0, len(bin), 2):
+        for opcode, width, name in THANGS:
+            if bin[i:i+2] == opcode and len(bin)-i-2 >= width and bin[i+2+width-1] & 1 == 0:
+                break
+        else:
+            continue
+
+        targ = i + 2 + int.from_bytes(bin[i+2:i+2+width], byteorder='big', signed=True)
+
+        if not 0 <= targ <= len(rom):
+            continue
+
+        yield i, (targ, name, width)
+
+
+def filter_by_ranges(stream, ranges):
+    # Dodgy sorting stuff -- so that the range start or stop marker always precedes that offset!
+    biglist = sorted(chain(
+        (itm for r in ranges for itm in [(r.start, 0, True), (r.stop, 0, False)]),
+        ((offset, 1, payload) for (offset, payload) in stream),
+    ))
+
+    state = False
+    for offset, marker, payload in biglist:
+        if marker == 0:
+            state = payload
+        else:
+            if state:
+                yield offset, payload
+
+
+# 0=off, 1=on but islands not hidden, 2=islands hidden
+def get_islandguess_state(manual):
+    is_on = 0
+
+    for offset, *args in manual.get('ISLANDGUESS', []):
+        if offset:
+            raise ValueError('Activate ISLANDGUESS from offset 0')
+
+        args = list(args)
+
+        if not args:
+            is_on = 1
+        elif args == ['ON']:
+            is_on = 1
+        elif args == ['HIDE']:
+            is_on = 2
+        elif args == ['OFF']:
+            is_on = 0
+        else:
+            raise ValueError('Illegal ISLANDGUESS args: %s', ' '.join(args))
+
+    return is_on
+
+
+# Just in case islandguess finds a false positive (unlikely)
+def get_nonislands_from_manual(manual):
+    return (offset for (offset, *args) in manual.get('NONISLAND', []))
+
+
+def islandguess(rom, exclude=[]): # returns iterator of (referer, referent) pairs
+    exclude = set(exclude)
+    tenzeroes = bytes(10)
+
+    for i in range(0, len(rom), 16):
+        this_16 = rom[i:i+16]
+
+        if not this_16.startswith(b'\x60\xff'): continue
+        if not this_16.endswith(tenzeroes): continue
+
+        if i in exclude: continue
+
+        targ, = struct.unpack_from('>l', this_16, 2)
+        targ += i + 2
+
+        if not 0 <= targ < len(rom): continue
+        if targ & 1: continue
+
+        # this is definitely a legit target!
+        yield i, targ
+
+
+
+
+
+
+
+
+
+try:
+    srcbase, rombase = argv[1:]
+except ValueError:
+    srcbase = None
+    rombase, = argv[1:]
+
+rom = trim_rom(open(rombase, 'rb').read())
+
+# for offset, targoffset, kind, numbytes in findrefs(rom):
+#     print(hex(offset), hex(targoffset), kind, numbytes)
+
+# Sneaky: edit the manual file as a convenience to the programmer!
+# And be sure to preserve its line endings!
+
+manual_path = rombase + '-info.txt'
+
+try:
+    with open(manual_path) as f:
+        manual = f.read()
+except FileNotFoundError:
+    pass
+else:
+    myre = re.compile(r'^(\+?)([A-Fa-f0-9]+)')
+    accum = 0
+    numlen = 1
+
+    linelist = []
+
+    for line in manual.splitlines(keepends=True):
+        m = myre.match(line)
+        if m:
+            if m.group(1):
+                nowat = accum + int(m.group(2), 16)
+                line = ('%0' + str(numlen) + 'X%s') % (nowat, line[m.span()[1]:])
+            else:
+                numlen = len(m.group(2))
+                accum = int(m.group(2), 16)
+
+        linelist.append(line)
+
+    bigstr = ''.join(linelist)
+
+    if bigstr != manual:
+        with open(manual_path, 'w') as f:
+            f.write(bigstr)
+
+try:
+    manual = parse_manual(parse_asm(read_mac_source_file(manual_path)))
+except FileNotFoundError:
+    manual = {}
+
+
+romvecinfo = Dataset(headers=['vtable', 'voffset', 'offset'])
+romvecglue = Dataset(headers=['vtable', 'voffset', 'register', 'offset'])
+srcvecinfo = Dataset(headers=['name', 'vtable', 'voffset', 'register', 'comment'])
+romtrapinfo = Dataset(headers=['trap', 'offset'])
+srctrapinfo = Dataset(headers=['trap', 'name'])
+
+if srcbase:
+    for vtloc in [path.join(srcbase, 'Make', 'VectorTable.a'), path.join(srcbase, 'VectorTable.a')]:
+        try:
+            vectbl_src = read_mac_source_file(vtloc)
+        except FileNotFoundError:
+            continue
+        else:
+            romvecinfo = vector_table_from_rom(rom)
+            romvecglue = vector_glue_from_rom(rom)
+            srcvecinfo = vector_routines_from_source(vectbl_src)
+            break
+
+    for ttloc in [path.join(srcbase, 'OS', 'DispTable.a'), path.join(srcbase, 'DispTable.a')]:
+        try:
+            traptbl_src = read_mac_source_file(ttloc)
+        except FileNotFoundError:
+            continue
+        else:
+            romtrapinfo = trap_offsets_from_rom(rom)
+            srctrapinfo = trap_routines_from_source(traptbl_src)
+            break
+
+
+
+
+glueoffsets = romvecglue.get_col(romvecglue.headers.index('offset'))
+
+
+
+# Generic, useful code:
+
+
+# This dict helps us figure out the correct order to place the "entry point" chunks so that
+# Vectorize will insert the vector glues in the original order
+
+gluelocs = {(vt, vo): offset for (vt, vo, reg, offset) in romvecglue}
+implocs = {(vt, vo): offset for (vt, vo, offset) in romvecinfo}
+
+gluelocs_by_label = {}
+for (lbl, vt, vo, reg, cmt) in srcvecinfo:
+    try:
+        gluelocs_by_label[lbl] = gluelocs[vt, vo]
+    except KeyError:
+        raise
+
+
+imploc_of_glue = {}
+for (vt, vo, reg, offset) in romvecglue:
+    imploc_of_glue[offset] = implocs[vt, vo]
+all_imps = set(implocs.values())
+
+
+
+
+
+
+
+
+
+
+# ISLANDGUESS
+
+islandguess_state = get_islandguess_state(manual)
+
+if islandguess_state:
+    islands = list(islandguess(rom, exclude=get_nonislands_from_manual(manual)))
+else:
+    islands = []
+
+island_dict = dict(islands)
+island_targ_set = set(targ for (src, targ) in islands)
+
+# New problem: the glue is all in the wrong order! How me fixy this?
+# have in island_loc -> idx mapping? That'd work...
+idx_of_island = {}
+last_island = None
+for src, targ in islands:
+    if src - 16 == last_island:
+        this_idx = prev_idx + 1
+    else:
+        this_idx = 0
+
+    idx_of_island[src] = this_idx
+
+    last_island = src
+    prev_idx = this_idx
+
+
+
+
+
+# CREATE a gigantic defaultdict with offset -> [label, label] mappings!
+# (and do some freeform comments while we're at it!)
+alllabels = defaultdict(lambda: set())
+
+veclabeldict = {(vt, vo): lbl for (lbl, vt, vo, reg, cmt) in srcvecinfo} # use this for later
+for vt, vo, offset in romvecinfo:
+    try:
+        lbl = veclabeldict[vt, vo]
+    except KeyError:
+        lbl = 'MGR%04X_VEC%04X' % (vt, vo)
+
+    alllabels[offset].add(lbl)
+
+traplabeldict = dict(srctrapinfo)
+for trap, offset in romtrapinfo:
+    lbl = traplabeldict[trap]
+    alllabels[offset].add(lbl)
+
+for offset, *args in chain(manual.get('MOD', []), manual.get('ENTRY', [])):
+    try:
+        lbl, *_ = args
+    except ValueError:
+        pass
+
+    alllabels[offset].add(lbl)
+
+# Override labels that have been set for islands???
+# This allows ISLANDGUESS to be set without extensive manual editing
+# Not very functional though...
+
+for (src, targ) in islands:
+    # Fail if target neither has a name nor is a vector glue...
+    # Simply because I'd like to give the island module a temporary name
+
+    try:
+        targ = imploc_of_glue[targ]
+    except KeyError:
+        pass
+
+    try:
+        label = alllabels[targ]
+        if not label: raise ValueError
+    except (KeyError, ValueError):
+        label = 'UNRESOLVED_%X' % targ
+        #raise ValueError('ISLAND target unresolved at $%X: BRA.L $%X' % (src, targ))
+    else:
+        label = min(label, key=lambda x: (len(x), x))
+
+    label = 'ISLAND_%X_%s' % (src, label)
+
+    alllabels[src] = [label]
+
+
+
+
+
+
+# DONE CREATING ^^ ... PUT THAT IN A FUNCTION.
+
+
+# Now do something similar for comments
+cmts_by_label = defaultdict(lambda: [])
+for (lbl, vt, vo, reg, cmt) in srcvecinfo:
+    if cmt:
+        fmt = 'VectorTable comment: %s' % cmt
+    else:
+        fmt = 'VectorTable entry uncommented'
+    cmts_by_label[lbl].append(fmt)
+for trap, lbl in srctrapinfo:
+    cmts_by_label[lbl].append('Trap %04X' % trap)
+
+
+
+# And have a way to look up vector info based on offset:
+
+
+
+
+filerngs = list(file_ranges_from_manual(manual))
+
+numbytes = sum(r.stop - r.start for r, *_ in filerngs)
+print('Unlinking', round(numbytes/len(rom)*100, 1), 'percent of rom')
+
+gluelocs_for_modguess = ((offset, vt, vo) for (vt, vo, reg, offset) in romvecglue)
+implocs_for_modguess = ((offset, vt, vo) for (vt, vo, offset) in romvecinfo)
+
+base_mod_rngs_and_their_reasons = module_ranges(
+    starts = aggregate_reasons(
+        ((o,'vector glue above')     for o in certain_module_boundaries_from_glue_offsets(glueoffsets)),
+        ((o+16,'island above')       for (o, targ) in islands),
+        ((o,'MOD directive')         for o in (offset for offset, *_ in manual.get('MOD', []))),
+        ((o,'FILE directive')        for o in (frng.start for frng, *_ in filerngs)),
+        modguess(
+            rom=rom,
+            ranges=feature_ranges_from_manual(manual, 'MODGUESS'),
+            noranges=ranges_that_must_be_in_a_single_module(gluelocs=gluelocs_for_modguess, implocs=implocs_for_modguess),
+            labels=alllabels,
+        ),
+        ((o,'BRA.L island')          for (o, targ) in islands),
+        ((o,'start of ROM')          for o in [0]),
+    ),
+    stops = aggregate_reasons(
+        ((o,'vector glue below')     for o in glueoffsets),
+        ((o,'BRA.L island below')    for (o, targ) in islands),
+        ((o+16,'end of island')      for (o, targ) in islands),
+        ((o,'end of FILE directive') for o in (frng.stop for frng, *_ in filerngs)),
+        ((o,'end of ROM')            for o in [len(rom)]),
+    ),
+)
+
+modrngs = list(trimmed_module_ranges(base_mod_rngs_and_their_reasons, rom=rom, glues=glueoffsets))
+
+
+
+# And let's create a list of references...
+# (For now, we will not care if the targes are labelled or not)
+references = list(filter_by_ranges(
+    stream=findrefs(rom),
+    ranges=feature_ranges_from_manual(manual, 'REFGUESS'),
+))
+
+
+
+# Now we know the file ranges, the module ranges, and the labels to apply to those modules!
+
+
+
+for frng, *args in filerngs:
+    relpath = args[0]
+    if srcbase:
+        abspath = path.join(srcbase, relpath)
+    else:
+        abspath = path.join(path.dirname(rombase), relpath)
+
+    filemods = [(mrng, start_reasons, stop_reasons) for (mrng, start_reasons, stop_reasons) in modrngs if frng.start <= mrng.start < frng.stop]
+
+    real_start = min(mrng.start for mrng, *_ in filemods)
+    real_stop = max(mrng.stop for mrng, *_ in filemods)
+
+    obj = MPWObject()
+
+    obj.putfirst()
+    obj.putcomment('UNLINKED FROM MAC OS ROM -- ELLIOT WAS HERE\n   [%X, %X)' % (real_start, real_stop))
+    obj.putdict(['Main'])
+
+    for (mrng, start_reasons, stop_reasons) in filemods:
+        mod_data = bytearray(rom[mrng.start:mrng.stop])
+        modname = None
+
+        veclabels = sortedlist()        # automatically sorted by glue, then by offset!
+        nonveclabels = sortedlist()
+
+        if islandguess_state == 2 and mrng.start in island_dict: # ISLANDGUESS HIDE
+            continue
+
+        for offset, offset_labels in alllabels.items():
+            if not mrng.start <= offset < mrng.stop: continue
+
+            for label in offset_labels:
+                try:
+                    glue = gluelocs_by_label[label]
+                except KeyError:
+                    nonveclabels.add((0, offset, label)) # sort by offset if it's a non-glued label
+                else:
+                    veclabels.add((glue, offset, label)) # or by glue location if necessary
+
+        for label_list in (veclabels, nonveclabels):
+            try:
+                glue, offset, label = label_list[0]
+            except IndexError:
+                pass
+            else:
+                if offset == mrng.start:
+                    modname = label
+                    label_list.pop(0)
+                    break
+        else:
+            modname = 'AUTOMOD_%X' % mrng.start
+
+        # (offset, label) from (glue, offset, label) format
+        entries_in_chunk_order = [(o, l) for ll in (veclabels, nonveclabels) for (g, o, l) in ll]
+        entries_in_offset_order = sorted(entries_in_chunk_order)
+
+
+        # Decide which refs I should actually twiddle:
+        bad_refs = []
+        good_refs = []
+        for (offset, (targ, kind, width)) in references:
+            if not mrng.start <= offset < mrng.stop:
+                continue
+
+            # Figure out the label of the referent! This can be slightly tricky...
+            label = None
+
+            orig_targ = targ
+
+            if islandguess_state == 2:
+                try:
+                    targ = island_dict[targ]
+                except KeyError:
+                    pass
+
+            if targ in all_imps: # rare -- a direct call of a vectorised function
+                try:
+                    label = alllabels[targ]
+                    if not label: raise ValueError
+                except (KeyError, ValueError):
+                    pass
+                else:
+                    label = '__v__' + min(label, key=lambda x: (len(x), x))
+
+            if label is None:
+                try:
+                    targ = imploc_of_glue[targ]
+                except KeyError:
+                    pass
+                
+                try:
+                    label = alllabels[targ]
+                    if not label: raise ValueError
+                except (KeyError, ValueError):
+                    pass
+                else:
+                    label = min(label, key=lambda x: (len(x), x))
+
+            if not label: label = None
+
+            if mrng.start <= targ < mrng.stop:
+                continue # currently only want to touch outgoings
+
+            if label:
+                good_refs.append((offset, targ, kind, width, label, idx_of_island.get(orig_targ, -1)))
+
+                if kind.startswith('B'):
+                    # print('doing a weird one!')
+                    offset_in_mod = offset + 2 - mrng.start
+                    mask = (1 << (8 * width)) - 1
+                    replacewith = (-offset_in_mod) & mask
+                    replacewith = replacewith.to_bytes(width, byteorder='big', signed=False)
+                else:
+                    replacewith = bytes(width)
+                mod_data[offset-mrng.start+2:offset-mrng.start+2+width] = replacewith # zero out -- put this elsewhere?
+
+            else:
+                bad_refs.append((offset, targ, kind, width))
+
+        # sort good_refs by idx_of_island so that branch islands are inserted in the correct order!
+        good_refs.sort(key=lambda tpl: tpl[-1])
+        good_refs = [x[:-1] for x in good_refs] # remove that extra field from good_refs
+        good_refs.reverse()
+
+
+
+
+        dict_names = (l for ll in (veclabels, nonveclabels) for (g, o, l) in ll)
+        dict_names = chain([modname], dict_names)
+
+        # Figured out how to insert comments into the object, now mad with power
+
+        descname = 'Module: %s [%X, %X)' % (modname, mrng.start, mrng.stop)
+
+        c = ['#' * 85, '']
+        c.append(descname)
+        c.append('')
+        c.append('Module started due to: %s' % ', '.join(start_reasons))
+
+        if good_refs:
+            c.append('')
+            c.append('Resolved outgoing references:')
+            for (offset, targ, kind, width, label) in good_refs:
+                s = '   +%X (%X): %s' % (offset-mrng.start, offset, kind.replace('t', label))
+                if not real_start <= targ < real_stop:
+                    s += ' ; outside file'
+                c.append(s)
+
+
+        if bad_refs:
+            c.append('')
+            c.append('Unresolved outgoing references:')
+            for (offset, targ, kind, width) in bad_refs:
+                s = '   +%X (%X): %s' % (offset-mrng.start, offset, kind.replace('t', '$%X' % targ))
+                if not real_start <= targ < real_stop:
+                    s += ' ; bad outside file'
+                c.append(s)
+
+        cmts = cmts_by_label[modname]
+        if cmts:
+            c.append('')
+            c.extend(cmts_by_label[modname])
+
+        for (offset, label) in entries_in_offset_order:
+            c.append('')
+
+            leftnote = '+%X (%X): ' % (offset - mrng.start, offset)
+            c.append(leftnote + label)
+
+            leftnote = ' ' * len(leftnote)
+            for line in cmts_by_label[label]:
+                c.append(leftnote + line)
+
+        if c: obj.putcomment('\n   '.join(c))
+
+        # </madwithpower>
+
+
+        # Write actual semantic stuff:
+
+        obj.putdict(dict_names)
+        obj.putmod(modname)
+
+        obj.putsize(len(mod_data))
+        obj.putcontents(mod_data)
+
+        # Need to put the entries in the *correct order*!
+        for (offset, targ, kind, width, label) in good_refs:
+            if kind.startswith('B'):
+                obj.putweirdref(label, width, offset-mrng.start+2)
+            else:
+                obj.putsimpleref(label, width, offset-mrng.start+2)
+
+
+
+        for (offset, label) in entries_in_chunk_order:
+            obj.putentry(offset - mrng.start, label)
+        
+        obj.putcomment('%s ended due to: %s' % (modname, ', '.join(stop_reasons)))
+
+
+    obj.putlast()
+
+
+    if 'WRITEOUT' not in args: continue
+
+    obj_bin = bytes(obj)
+
+    try:
+        with open(abspath, 'rb') as f:
+            old = f.read()
+
+        if old != obj_bin:
+            raise ValueError('must write out')
+    except:
+        print('>', relpath)
+        try:
+            makedirs(path.dirname(abspath), exist_ok=True)
+        except FileNotFoundError:
+            pass
+        with open(abspath, 'wb') as f:
+            f.write(obj_bin)
+
+
+
+
