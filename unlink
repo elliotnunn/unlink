@@ -24,8 +24,12 @@ def trim_rom(rom):
 
 def read_mac_source_file(path):
     # May insert arbitrary blank lines!
-    with open(path, encoding='mac_roman') as f:
-        return f.read().replace('\r','\n')
+    with open(path, 'rb') as f:
+        src = f.read()
+        src = bytes(ch for ch in src if ch < 128)
+        src = src.replace(b'\r',b'\n')
+        src = src.decode('ascii')
+        return src
 
 
 def parse_asm(src):
@@ -694,7 +698,7 @@ for (lbl, vt, vo, reg, cmt) in srcvecinfo:
     try:
         gluelocs_by_label[lbl] = gluelocs[vt, vo]
     except KeyError:
-        raise
+        pass
 
 
 imploc_of_glue = {}
@@ -1049,8 +1053,11 @@ for frng, *args in filerngs:
 
         # Write actual semantic stuff:
 
+        flags = 1 << 3 # externally accessible
+        if 'NOFORCE' not in args: flags |= 1 << 7
+
         obj.putdict(dict_names)
-        obj.putmod(modname)
+        obj.putmod(modname, flags=flags)
 
         obj.putsize(len(mod_data))
         obj.putcontents(mod_data)
@@ -1091,6 +1098,8 @@ for frng, *args in filerngs:
             pass
         with open(abspath, 'wb') as f:
             f.write(obj_bin)
+        with open(abspath + '.idump', 'w') as f:
+            f.write('OBJ MPS ')
 
 
 
