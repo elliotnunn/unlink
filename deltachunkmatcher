@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+
+from sys import argv
+from itertools import cycle, islice
+from subprocess import run
+
+
+run(['sh', '-c', 'rm -f dcm*'])
+
+
+def roundrobin(*iterables):
+    "roundrobin('ABC', 'D', 'EF') --> A D E B F C"
+    # Recipe credited to George Sakkis
+    num_active = len(iterables)
+    nexts = cycle(iter(it).__next__ for it in iterables)
+    while num_active:
+        try:
+            for next in nexts:
+                yield next()
+        except StopIteration:
+            # Remove the iterator we just exhausted from the cycle.
+            num_active -= 1
+            nexts = cycle(islice(nexts, num_active))
+
+
+filenames = argv[1:]
+
+
+roms = [None] * len(filenames)
+for i, f in enumerate(filenames):
+    with open(f, 'rb') as fd:
+        roms[i] = fd.read()
+
+
+path_offset_stop_tuples = []
+
+with open(filenames[0] + '-info.txt') as f:
+    for l in f:
+        if '\t' not in l: continue
+        label, directive, *misc = l.split()
+        if directive.lower() != 'file': continue
+
+        file_offset = int(label, 16)
+        file_path, _, _ = misc[0].partition(',')
+
+        for l in f:
+            if '\t' not in l: continue
+            label, directive, *_ = l.split()
+            if directive.lower() != 'endf': continue
+
+            file_len = int(label, 16)
+
+            path_offset_stop_tuples.append((file_path, file_offset, file_len))
+            break
+
+# for p, o, l in path_offset_stop_tuples:
+#     print(p, hex(o), hex(l))
+
+
+path_offset_bin_tuples = []
+
+for p, o, s in path_offset_stop_tuples:
+    b = roms[0][o:s]
+    path_offset_bin_tuples.append((p,o,b))
+
+skippery = 128
+
+
+single_letters = iter('bcdefg')
+
+
+for n, r in zip(filenames[1:], roms[1:]):
+    print('Comparing %s against original %s' % (n, filenames[0]))
+
+    sl = next(single_letters)
+
+    for objpath, objoffset, objbin in path_offset_bin_tuples:
+        _, _, objname = objpath.rpartition('/')
+
+        earlier = reversed(range(0, objoffset, 16))
+        later = range(objoffset, len(r)-len(objbin)+16, 16)
+        bothways = roundrobin(later, earlier)
+
+        for tryoffset in bothways:
+            # print(hex(tryoffset), end='=', flush=True)
+            objbincmp = r[tryoffset:tryoffset+len(objbin)]
+
+            a = objbin[0:len(objbin):skippery]
+            b = objbincmp[0:len(objbin):skippery]
+
+            maxmatches = len(a)
+            matches = sum(ax == bx for (ax, bx) in zip(a, b))
+            # print(str(int(matches*100/len(objbin))) + '%', end= ' ', flush=True)
+            if matches * 3 >= maxmatches:
+                print('Found %s at %X (moved from %X)' % (objname, tryoffset, objoffset))
+ 
+                with open('dcm-a-%05X-%s' % (objoffset, objname), 'wb') as f:
+                    f.write(objbin)
+                with open('dcm-%s-%05X-%s-%05X' % (sl, objoffset, objname, tryoffset), 'wb') as f:
+                    f.write(objbincmp)
+
+                print('\tvbindiff dcm*%s*' % objname)
+
+                break
+
+        else:
+            print('Did not find %s' % objname)
